@@ -14,6 +14,7 @@ type checkFunc func(context.Context, *counterAssertions) error
 
 var checks = map[string]checkFunc{
 	"append-rollover":     runAppendRollover,
+	"compaction-lineage":  runCompactionLineage,
 	"compaction-recovery": runCompactionRecovery,
 	"replica-watermark":   runReplicaWatermark,
 }

@@ -190,6 +190,9 @@ the application service.
 - A stream watermark is monotonic and never exceeds the smallest live
   acknowledged end offset.
 - A completed compaction plan has exactly one compacted result segment.
+- A compacted segment's sources all resolve, belong to one stream, are
+  retired, match exactly one completed plan's record, and are claimed as
+  sources by no other completed plan.
 - Source segments are retired only when the result segment is durably stored.
 - A restart either restores the last complete snapshot or fails closed.
 - Concurrent append and compaction requests serialize at one mutation gate.
@@ -231,6 +234,7 @@ committed. Reads return immutable snapshot values.
 go build ./cmd/segmentd
 go run ./cmd/segmentd serve
 go run ./cmd/segmentd verify append-rollover
+go run ./cmd/segmentd verify compaction-lineage
 go run ./cmd/segmentd verify compaction-recovery
 go run ./cmd/segmentd verify replica-watermark
 ```

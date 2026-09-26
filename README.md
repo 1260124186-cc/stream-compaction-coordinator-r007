@@ -150,6 +150,7 @@ production checks exercise the real HTTP handler and file-backed state:
 
 ```bash
 go run ./cmd/segmentd verify append-rollover
+go run ./cmd/segmentd verify compaction-lineage
 go run ./cmd/segmentd verify compaction-recovery
 go run ./cmd/segmentd verify replica-watermark
 ```
@@ -184,6 +185,13 @@ On startup, the service loads the snapshot, aborts plans left in `running`
 state, returns their source segments to `sealed`, validates all references,
 and recomputes each stream watermark. A damaged snapshot fails startup instead
 of serving an uncertain state.
+
+Compaction results are held to a strict reference closure: every source segment
+must resolve, belong to the same stream, be retired, and match exactly one
+completed plan's record, and no other completed plan may claim the same
+sources. A snapshot whose compacted segment references missing, foreign,
+unretired, or multiply claimed sources is rejected before the listener starts,
+and the snapshot file is left untouched.
 
 ## Deferred verification boundary
 

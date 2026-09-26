@@ -65,6 +65,10 @@ func ValidateState(state *State) error {
 		}
 	}
 
+	if err := validateCompactionLineage(state); err != nil {
+		return err
+	}
+
 	if err := validateAudit(state.Audit, state.AuditSequence); err != nil {
 		return err
 	}
