@@ -65,6 +65,10 @@ func ValidateState(state *State) error {
 		}
 	}
 
+	if err := validateCompactionLineage(state); err != nil {
+		return err
+	}
+
 	if err := validateAudit(state.Audit, state.AuditSequence); err != nil {
 		return err
 	}
@@ -128,6 +132,17 @@ func validateStream(stream *Stream, state *State) error {
 			return NewError(CodeInconsistentState, "sealed list contains a segment in the wrong state").
 				WithDetail("segment_id", segmentID).
 				WithDetail("state", segment.State)
+		}
+	}
+	for segmentID, segment := range state.Segments {
+		if segment.StreamID != stream.ID ||
+			(segment.State != SegmentStateSealed && segment.State != SegmentStateCompacting) {
+			continue
+		}
+		if _, exists := seen[segmentID]; !exists {
+			return NewError(CodeInconsistentState, "live sealed segment is missing from the stream list").
+				WithDetail("stream_id", stream.ID).
+				WithDetail("segment_id", segmentID)
 		}
 	}
 
@@ -276,7 +291,15 @@ func validatePlan(plan *CompactionPlan, state *State) error {
 		return WrapError(CodeInconsistentState, "plan range is invalid", err).
 			WithDetail("plan_id", plan.ID)
 	}
+	seenSources := make(map[string]struct{}, len(plan.SourceSegmentIDs))
 	for _, segmentID := range plan.SourceSegmentIDs {
+		if _, seen := seenSources[segmentID]; seen {
+			return NewError(CodeInconsistentState, "plan contains a duplicate source segment").
+				WithDetail("plan_id", plan.ID).
+				WithDetail("segment_id", segmentID)
+		}
+		seenSources[segmentID] = struct{}{}
+
 		segment, exists := state.Segments[segmentID]
 		if !exists || segment == nil {
 			return NewError(CodeInconsistentState, "plan source segment is missing").
@@ -290,6 +313,11 @@ func validatePlan(plan *CompactionPlan, state *State) error {
 		}
 		if segment.Generation != plan.SourceGenerations[segmentID] {
 			return NewError(CodeInconsistentState, "plan source generation changed").
+				WithDetail("plan_id", plan.ID).
+				WithDetail("segment_id", segmentID)
+		}
+		if len(segment.SourceSegmentIDs) > 0 {
+			return NewError(CodeInconsistentState, "plan source is already a compacted result").
 				WithDetail("plan_id", plan.ID).
 				WithDetail("segment_id", segmentID)
 		}
@@ -314,21 +342,54 @@ func validatePlan(plan *CompactionPlan, state *State) error {
 			}
 		}
 	case PlanStateCompleted:
+		if plan.ResultChecksum == "" || plan.ResultSizeBytes <= 0 {
+			return NewError(CodeInconsistentState, "completed plan lacks result metadata").
+				WithDetail("plan_id", plan.ID)
+		}
 		result, exists := state.Segments[plan.ResultSegmentID]
 		if !exists || result == nil {
 			return NewError(CodeInconsistentState, "completed plan result is missing").
 				WithDetail("plan_id", plan.ID)
 		}
-		if result.Range != plan.Range || result.Checksum != plan.ResultChecksum {
+		if result.StreamID != plan.StreamID {
+			return NewError(CodeInconsistentState, "completed plan result belongs to another stream").
+				WithDetail("plan_id", plan.ID).
+				WithDetail("segment_id", result.ID)
+		}
+		if result.State != SegmentStateSealed {
+			return NewError(CodeInconsistentState, "completed plan result is not a live sealed segment").
+				WithDetail("plan_id", plan.ID).
+				WithDetail("segment_id", result.ID).
+				WithDetail("state", result.State)
+		}
+		if !result.Durable {
+			return NewError(CodeInconsistentState, "completed plan result is not durable").
+				WithDetail("plan_id", plan.ID).
+				WithDetail("segment_id", result.ID)
+		}
+		if result.Range != plan.Range || result.Checksum != plan.ResultChecksum ||
+			result.SizeBytes != plan.ResultSizeBytes {
 			return NewError(CodeInconsistentState, "completed plan result does not match the plan").
 				WithDetail("plan_id", plan.ID)
 		}
+		if !sameStringSequence(result.SourceSegmentIDs, plan.SourceSegmentIDs) {
+			return NewError(CodeInconsistentState, "completed plan result sources do not match plan sources").
+				WithDetail("plan_id", plan.ID).
+				WithDetail("result_segment_id", result.ID)
+		}
+		sourceRanges := make([]Range, 0, len(plan.SourceSegmentIDs))
 		for _, segmentID := range plan.SourceSegmentIDs {
-			if state.Segments[segmentID].State != SegmentStateRetired {
-				return NewError(CodeInconsistentState, "completed plan source is not retired").
+			source := state.Segments[segmentID]
+			if source.StreamID != plan.StreamID || source.State != SegmentStateRetired {
+				return NewError(CodeInconsistentState, "completed plan source is not a retired segment of the stream").
 					WithDetail("plan_id", plan.ID).
 					WithDetail("segment_id", segmentID)
 			}
+			sourceRanges = append(sourceRanges, source.Range)
+		}
+		if union, err := ValidateContiguousRanges(sourceRanges); err != nil || union != plan.Range {
+			return NewError(CodeInconsistentState, "completed plan source ranges do not match the result range").
+				WithDetail("plan_id", plan.ID)
 		}
 	case PlanStateAborted:
 		for _, segmentID := range plan.SourceSegmentIDs {
@@ -344,6 +405,103 @@ func validatePlan(plan *CompactionPlan, state *State) error {
 			WithDetail("state", plan.State)
 	}
 	return nil
+}
+
+// validateCompactionLineage verifies the bidirectional closure between a
+// completed plan, its live result segment, and the exact raw sources it
+// retired. Segments are intentionally kept after retirement so every compacted
+// byte range remains traceable to the same stream and one owning plan.
+func validateCompactionLineage(state *State) error {
+	owners := make(map[string]string)
+	completedByResult := make(map[string]string)
+	for planID, plan := range state.Plans {
+		if plan.State != PlanStateCompleted {
+			continue
+		}
+		if owner, exists := completedByResult[plan.ResultSegmentID]; exists {
+			return NewError(CodeInconsistentState, "compaction result belongs to multiple completed plans").
+				WithDetail("segment_id", plan.ResultSegmentID).
+				WithDetail("plan_id", planID).
+				WithDetail("other_plan_id", owner)
+		}
+		completedByResult[plan.ResultSegmentID] = planID
+
+		for _, sourceID := range plan.SourceSegmentIDs {
+			if owner, exists := owners[sourceID]; exists {
+				return NewError(CodeInconsistentState, "source segment was retired by another compaction plan").
+					WithDetail("segment_id", sourceID).
+					WithDetail("plan_id", planID).
+					WithDetail("other_plan_id", owner)
+			}
+			owners[sourceID] = planID
+		}
+	}
+
+	for segmentID, segment := range state.Segments {
+		if segment.State == SegmentStateRetired {
+			if owner, exists := owners[segmentID]; !exists {
+				return NewError(CodeInconsistentState, "retired segment has no completed compaction plan").
+					WithDetail("segment_id", segmentID)
+			} else if state.Plans[owner].StreamID != segment.StreamID {
+				return NewError(CodeInconsistentState, "retired segment was taken over by a plan from another stream").
+					WithDetail("segment_id", segmentID).
+					WithDetail("plan_id", owner)
+			}
+		}
+		if len(segment.SourceSegmentIDs) == 0 {
+			continue
+		}
+
+		planID, exists := completedByResult[segmentID]
+		if !exists {
+			return NewError(CodeInconsistentState, "compacted result is not attached to a completed plan").
+				WithDetail("segment_id", segmentID)
+		}
+		plan := state.Plans[planID]
+		if plan.StreamID != segment.StreamID {
+			return NewError(CodeInconsistentState, "compacted result belongs to a plan in another stream").
+				WithDetail("segment_id", segmentID).
+				WithDetail("plan_id", planID)
+		}
+		if !sameStringSequence(segment.SourceSegmentIDs, plan.SourceSegmentIDs) {
+			return NewError(CodeInconsistentState, "compacted result lineage does not match its plan").
+				WithDetail("segment_id", segmentID).
+				WithDetail("plan_id", planID)
+		}
+		for _, sourceID := range segment.SourceSegmentIDs {
+			source := state.Segments[sourceID]
+			if source == nil {
+				return NewError(CodeInconsistentState, "compacted result source is missing").
+					WithDetail("segment_id", segmentID).
+					WithDetail("source_segment_id", sourceID)
+			}
+			if source.StreamID != segment.StreamID {
+				return NewError(CodeInconsistentState, "compacted result source belongs to another stream").
+					WithDetail("segment_id", segmentID).
+					WithDetail("source_segment_id", sourceID)
+			}
+			if owner := owners[sourceID]; owner != planID {
+				return NewError(CodeInconsistentState, "compacted result source was retired by another plan").
+					WithDetail("segment_id", segmentID).
+					WithDetail("source_segment_id", sourceID).
+					WithDetail("plan_id", planID).
+					WithDetail("other_plan_id", owner)
+			}
+		}
+	}
+	return nil
+}
+
+func sameStringSequence(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateAudit(events []AuditEvent, sequence uint64) error {
